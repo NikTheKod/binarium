@@ -36,8 +36,8 @@ from fake_useragent import UserAgent
 # ============================================
 # ТВОИ ТОКЕНЫ
 # ============================================
-TELEGRAM_TOKEN = "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"  # ЗАМЕНИ!!!
-OPENAI_API_KEY = "8651330648:AAGQdVLP73PWwdQNJf-sL32S_gJsqL3cYqg"      # опционально
+TELEGRAM_TOKEN = "8651330648:AAGQdVLP73PWwdQNJf-sL32S_gJsqL3cYqg"  # ЗАМЕНИ!!!
+OPENAI_API_KEY = "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"      # опционально
 # ============================================
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
