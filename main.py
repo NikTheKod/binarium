@@ -4,13 +4,13 @@
 import subprocess
 import sys
 
-packages = ['numpy', 'ccxt', 'pyTelegramBotAPI', 'requests']
+packages = ['numpy', 'ccxt', 'pyTelegramBotAPI', 'requests', 'threading']
 for package in packages:
     try:
         if package == 'pyTelegramBotAPI':
             __import__('telebot')
-        elif package == 'requests':
-            __import__('requests')
+        elif package == 'threading':
+            __import__('threading')
         else:
             __import__(package)
     except ImportError:
@@ -25,7 +25,9 @@ import ccxt
 import numpy as np
 import time
 import requests
-import random
+import threading
+import json
+import os
 from datetime import datetime
 
 # ============================================
@@ -44,43 +46,65 @@ exchange = ccxt.binance({
     'headers': {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
 })
 
-# Хранилище для отслеживания цен (чтобы считать реальный P&L)
-price_history = {}
+# Хранилище данных
+user_data = {}  # {user_id: {'tracking': bool, 'alerts': dict, 'portfolio': dict}}
+price_cache = {}
+
+# Файл для сохранения настроек
+SETTINGS_FILE = "user_settings.json"
+
+def load_settings():
+    global user_data
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, 'r') as f:
+                user_data = json.load(f)
+        except:
+            user_data = {}
+
+def save_settings():
+    with open(SETTINGS_FILE, 'w') as f:
+        json.dump(user_data, f)
 
 # ============================================
 # ПОЛУЧЕНИЕ ДАННЫХ
 # ============================================
 
-def get_historical_prices(symbol='BTC/USDT', limit=30):
-    """Получает цены с Binance"""
+def get_crypto_price(symbol='BTC'):
+    """Получает текущую цену"""
     try:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe='5m', limit=limit)
-        closes = [candle[4] for candle in ohlcv]
-        if len(closes) >= 10:
-            return closes
+        pair = f"{symbol}/USDT"
+        ticker = exchange.fetch_ticker(pair)
+        return ticker['last']
     except:
-        pass
-    
+        try:
+            url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}USDT"
+            response = requests.get(url, timeout=5)
+            if response.status_code == 200:
+                return float(response.json()['price'])
+        except:
+            return None
+    return None
+
+def get_historical_prices(symbol='BTC', limit=30):
+    """Получает историю цен"""
     try:
-        symbol2 = symbol.replace('/', '')
-        url = f"https://api.binance.com/api/v3/klines?symbol={symbol2}&interval=5m&limit={limit}"
-        response = requests.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
-        if response.status_code == 200:
-            data = response.json()
-            return [float(candle[4]) for candle in data]
+        pair = f"{symbol}/USDT"
+        ohlcv = exchange.fetch_ohlcv(pair, timeframe='5m', limit=limit)
+        return [candle[4] for candle in ohlcv]
     except:
-        pass
-    
-    # Тестовые данные
-    base_price = 50000 if 'BTC' in symbol else 3000
-    closes = [base_price + np.random.randn() * 100 for _ in range(limit)]
-    for i in range(1, len(closes)):
-        closes[i] = closes[i-1] + np.random.randn() * 50
-    return [abs(x) for x in closes]
+        try:
+            url = f"https://api.binance.com/api/v3/klines?symbol={symbol}USDT&interval=5m&limit={limit}"
+            response = requests.get(url, timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                return [float(candle[4]) for candle in data]
+        except:
+            return None
+    return None
 
 def get_rsi(prices, period=14):
-    """Расчёт RSI"""
-    if len(prices) < period + 1:
+    if not prices or len(prices) < period + 1:
         return 50
     deltas = np.diff(prices)
     gains = np.where(deltas > 0, deltas, 0)
@@ -96,141 +120,131 @@ def get_rsi(prices, period=14):
     return 100 - (100 / (1 + rs))
 
 # ============================================
-# РАСЧЁТ ПРИБЫЛИ/УБЫТКА
+# РАСЧЁТ РЕАЛЬНОЙ ПРИБЫЛИ (без $100)
 # ============================================
 
-def calculate_pl(entry_price, current_price, investment=100):
-    """Рассчитывает реальную прибыль/убыток"""
-    # Сколько монет купили на $100
-    coins_bought = investment / entry_price
-    # Текущая стоимость портфеля
-    current_value = coins_bought * current_price
-    # Прибыль/убыток в долларах
-    pnl_usd = current_value - investment
-    # Прибыль/убыток в процентах
-    pnl_percent = ((current_price - entry_price) / entry_price) * 100
-    
-    return {
-        'pnl_usd': pnl_usd,
-        'pnl_percent': pnl_percent,
-        'current_value': current_value,
-        'coins': coins_bought
-    }
-
-def calculate_potential_targets(price, rsi, change_percent):
-    """Рассчитывает потенциальные цели (Take Profit / Stop Loss)"""
-    
-    # Определяем цели на основе RSI и импульса
-    if rsi < 30:  # Перекупленность - потенциал роста
-        tp1_percent = random.uniform(1.5, 2.5)  # +1.5-2.5%
-        tp2_percent = random.uniform(3.0, 4.5)  # +3-4.5%
-        sl_percent = random.uniform(-1.2, -0.8)  # -0.8-1.2%
-        signal_type = "LONG 🟢"
-        action_text = "Рекомендуется покупка"
-    elif rsi > 70:  # Перепроданность - потенциал падения
-        tp1_percent = random.uniform(-2.5, -1.5)  # -1.5-2.5%
-        tp2_percent = random.uniform(-4.5, -3.0)  # -3-4.5%
-        sl_percent = random.uniform(0.8, 1.2)  # +0.8-1.2%
-        signal_type = "SHORT 🔴"
-        action_text = "Рекомендуется продажа"
-    elif change_percent > 1:  # Хороший импульс вверх
-        tp1_percent = random.uniform(1.0, 1.8)
-        tp2_percent = random.uniform(2.0, 3.0)
-        sl_percent = random.uniform(-0.7, -0.4)
-        signal_type = "LONG 🟢"
-        action_text = "Импульс вверх"
-    elif change_percent < -1:  # Импульс вниз
-        tp1_percent = random.uniform(-1.8, -1.0)
-        tp2_percent = random.uniform(-3.0, -2.0)
-        sl_percent = random.uniform(0.4, 0.7)
-        signal_type = "SHORT 🔴"
-        action_text = "Импульс вниз"
+def calculate_real_pl(entry_price, current_price, amount=0):
+    """
+    Рассчитывает реальную прибыль/убыток
+    amount - количество монет (если 0, считаем для 1 монеты)
+    """
+    if amount == 0:
+        # Показываем в процентах и абсолютном изменении для 1 монеты
+        percent_change = ((current_price - entry_price) / entry_price) * 100
+        abs_change = current_price - entry_price
+        return {
+            'percent': percent_change,
+            'abs_change': abs_change,
+            'current_price': current_price,
+            'entry_price': entry_price
+        }
     else:
-        tp1_percent = random.uniform(0.5, 1.0)
-        tp2_percent = random.uniform(1.2, 2.0)
-        sl_percent = random.uniform(-0.5, -0.3)
-        signal_type = "WAIT ⏳"
-        action_text = "Нейтральный рынок"
+        # Реальный P&L для портфеля
+        current_value = amount * current_price
+        entry_value = amount * entry_price
+        pnl = current_value - entry_value
+        pnl_percent = ((current_price - entry_price) / entry_price) * 100
+        return {
+            'pnl': pnl,
+            'pnl_percent': pnl_percent,
+            'current_value': current_value,
+            'entry_value': entry_value
+        }
+
+# ============================================
+# ФОНОВОЕ ОТСЛЕЖИВАНИЕ
+# ============================================
+
+def start_price_tracking(user_id):
+    """Запускает фоновое отслеживание цены для пользователя"""
+    if user_id not in user_data:
+        user_data[user_id] = {'tracking': False, 'alerts': {}, 'portfolio': {}}
     
-    # Рассчитываем цены целей
-    tp1_price = price * (1 + tp1_percent / 100)
-    tp2_price = price * (1 + tp2_percent / 100)
-    sl_price = price * (1 + sl_percent / 100)
+    user_data[user_id]['tracking'] = True
+    save_settings()
     
-    # Считаем прибыль/убыток с $100 для каждой цели
-    if signal_type == "LONG 🟢" or signal_type == "WAIT ⏳":
-        tp1_profit = (tp1_percent / 100) * 100
-        tp2_profit = (tp2_percent / 100) * 100
-        sl_loss = (sl_percent / 100) * 100
-    else:  # SHORT
-        tp1_profit = abs(tp1_percent / 100) * 100
-        tp2_profit = abs(tp2_percent / 100) * 100
-        sl_loss = abs(sl_percent / 100) * 100
+    # Запускаем поток отслеживания если ещё не запущен
+    thread_name = f"tracker_{user_id}"
+    if not any(t.name == thread_name for t in threading.enumerate()):
+        tracker_thread = threading.Thread(target=price_tracker, args=(user_id,), name=thread_name, daemon=True)
+        tracker_thread.start()
+
+def stop_price_tracking(user_id):
+    """Останавливает фоновое отслеживание"""
+    if user_id in user_data:
+        user_data[user_id]['tracking'] = False
+        save_settings()
+
+def price_tracker(user_id):
+    """Фоновая функция отслеживания цены"""
+    print(f"🔍 Запущен трекер для пользователя {user_id}")
     
-    return {
-        'signal_type': signal_type,
-        'action': action_text,
-        'tp1_price': tp1_price,
-        'tp1_percent': tp1_percent,
-        'tp1_profit': tp1_profit,
-        'tp2_price': tp2_price,
-        'tp2_percent': tp2_percent,
-        'tp2_profit': tp2_profit,
-        'sl_price': sl_price,
-        'sl_percent': sl_percent,
-        'sl_loss': sl_loss
-    }
-
-def analyze_with_ai(closes, rsi_value, symbol, targets):
-    """Анализ с ИИ"""
-    price_now = closes[-1]
-    price_before = closes[-2]
-    change = ((price_now - price_before) / price_before) * 100
+    last_prices = {}
+    alert_threshold = 1.0  # Оповещать при изменении на 1%
     
-    result = f"""🎯 <b>ТОРГОВЫЙ СИГНАЛ</b>
-━━━━━━━━━━━━━━━━━━━━━
-
-{targets['signal_type']} <b>Сигнал:</b> {targets['action']}
-
-📊 <b>Индикаторы:</b>
-• RSI: {rsi_value:.1f}
-• Импульс: {change:+.2f}%
-
-━━━━━━━━━━━━━━━━━━━━━
-<b>💰 ПРИБЫЛЬ/УБЫТОК С $100</b>
-
-🎯 <b>Take Profit 1:</b>
-   Цена: {targets['tp1_price']:.0f}$ 
-   Профит: <b>+{targets['tp1_profit']:.2f}$</b> <code>(+{abs(targets['tp1_percent']):.1f}%)</code>
-
-🎯 <b>Take Profit 2:</b>
-   Цена: {targets['tp2_price']:.0f}$
-   Профит: <b>+{targets['tp2_profit']:.2f}$</b> <code>(+{abs(targets['tp2_percent']):.1f}%)</code>
-
-🛑 <b>Stop Loss:</b>
-   Цена: {targets['sl_price']:.0f}$
-   Убыток: <b>-{targets['sl_loss']:.2f}$</b> <code>({targets['sl_percent']:.1f}%)</code>
-
-━━━━━━━━━━━━━━━━━━━━━
-📈 <b>Риск/Прибыль (R:R):</b> 1:{max(1.5, targets['tp1_profit']/abs(targets['sl_loss'])):.1f}"""
-
-    # Добавляем ИИ анализ если есть ключ
-    if OPENAI_API_KEY != "ТВОЙ_КЛЮЧ_ОТ_OPENAI" and OPENAI_API_KEY:
+    while user_data.get(user_id, {}).get('tracking', False):
         try:
-            import openai
-            openai.api_key = OPENAI_API_KEY
-            prompt = f"{symbol}: цена={price_now:.0f}, RSI={rsi_value:.1f}, импульс={change:+.1f}%. Дай совет в 2 строках."
-            response = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.5,
-                timeout=10
-            )
-            result += f"\n\n🤖 <b>ИИ-совет:</b>\n{response.choices[0].message.content}"
-        except:
-            pass
+            # Проверяем BTC и ETH
+            for symbol in ['BTC', 'ETH']:
+                current_price = get_crypto_price(symbol)
+                if current_price:
+                    # Если есть сохранённая цена
+                    if symbol in last_prices:
+                        old_price = last_prices[symbol]
+                        change_percent = ((current_price - old_price) / old_price) * 100
+                        
+                        # Если изменение больше порога
+                        if abs(change_percent) >= alert_threshold:
+                            # Отправляем уведомление
+                            direction = "🟢 ВВЕРХ" if change_percent > 0 else "🔴 ВНИЗ"
+                            emoji = "📈" if change_percent > 0 else "📉"
+                            
+                            alert_text = f"""<b>{emoji} {symbol}/USDT - {direction}</b>
+
+💰 <b>Было:</b> ${old_price:,.0f}
+💰 <b>Стало:</b> ${current_price:,.0f}
+📊 <b>Изменение:</b> <b>{change_percent:+.2f}%</b>
+
+🕐 {datetime.now().strftime('%H:%M:%S')}"""
+                            
+                            try:
+                                bot.send_message(user_id, alert_text, parse_mode='HTML')
+                            except:
+                                pass
+                            
+                            # Обновляем цену
+                            last_prices[symbol] = current_price
+                    else:
+                        # Первый запуск - сохраняем цену
+                        last_prices[symbol] = current_price
+            
+            # Проверяем портфель пользователя (если есть активные позиции)
+            portfolio = user_data.get(user_id, {}).get('portfolio', {})
+            for symbol, position in portfolio.items():
+                if position.get('active', False):
+                    current_price = get_crypto_price(symbol)
+                    if current_price:
+                        entry = position['entry_price']
+                        change = ((current_price - entry) / entry) * 100
+                        
+                        # Оповещаем при достижении целей
+                        if 'tp1' in position and current_price >= position['tp1'] and not position.get('tp1_alerted', False):
+                            bot.send_message(user_id, f"🎯 <b>ЦЕЛЬ 1 ДОСТИГНУТА!</b>\n{symbol}: +{change:.1f}%\nПрибыль: ${calculate_real_pl(entry, current_price, position['amount'])['pnl']:.2f}", parse_mode='HTML')
+                            user_data[user_id]['portfolio'][symbol]['tp1_alerted'] = True
+                            save_settings()
+                        
+                        if 'sl' in position and current_price <= position['sl'] and not position.get('sl_alerted', False):
+                            bot.send_message(user_id, f"🛑 <b>СТОП-ЛОСС СРАБОТАЛ!</b>\n{symbol}: {change:.1f}%\nУбыток: ${calculate_real_pl(entry, current_price, position['amount'])['pnl']:.2f}", parse_mode='HTML')
+                            user_data[user_id]['portfolio'][symbol]['sl_alerted'] = True
+                            save_settings()
+            
+        except Exception as e:
+            print(f"Ошибка трекера: {e}")
+        
+        # Проверяем каждые 30 секунд
+        time.sleep(30)
     
-    return result
+    print(f"🔴 Трекер для {user_id} остановлен")
 
 # ============================================
 # КЛАВИАТУРЫ
@@ -239,27 +253,40 @@ def analyze_with_ai(closes, rsi_value, symbol, targets):
 def main_keyboard():
     keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     keyboard.add(
-        KeyboardButton("📊 ПОЛУЧИТЬ СИГНАЛ"),
-        KeyboardButton("📈 BTC/USDT"),
-        KeyboardButton("🔷 ETH/USDT"),
-        KeyboardButton("💰 P&L ОТСЛЕЖИВАНИЕ"),
+        KeyboardButton("📊 АНАЛИЗ"),
+        KeyboardButton("💰 МОЙ ПОРТФЕЛЬ"),
+        KeyboardButton("🔔 ФОНОВЫЙ РЕЖИМ"),
         KeyboardButton("ℹ️ ПОМОЩЬ")
     )
     return keyboard
 
-def inline_menu():
-    keyboard = InlineKeyboardMarkup()
-    keyboard.add(InlineKeyboardButton("🔄 НОВЫЙ СИГНАЛ", callback_data="new"))
+def crypto_keyboard():
+    keyboard = InlineKeyboardMarkup(row_width=2)
     keyboard.add(
-        InlineKeyboardButton("₿ BTC", callback_data="btc"), 
-        InlineKeyboardButton("⟠ ETH", callback_data="eth")
+        InlineKeyboardButton("₿ BTC/USDT", callback_data="analyze_BTC"),
+        InlineKeyboardButton("⟠ ETH/USDT", callback_data="analyze_ETH")
     )
+    keyboard.add(InlineKeyboardButton("🏠 МЕНЮ", callback_data="menu"))
     return keyboard
 
-def pl_keyboard(symbol):
-    keyboard = InlineKeyboardMarkup()
-    keyboard.add(InlineKeyboardButton(f"🔄 ОБНОВИТЬ {symbol}", callback_data=f"pl_{symbol}"))
-    keyboard.add(InlineKeyboardButton("📊 НОВЫЙ СИГНАЛ", callback_data="new"))
+def tracking_keyboard():
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        InlineKeyboardButton("🔔 ВКЛЮЧИТЬ", callback_data="tracking_on"),
+        InlineKeyboardButton("🔕 ВЫКЛЮЧИТЬ", callback_data="tracking_off")
+    )
+    keyboard.add(InlineKeyboardButton("📊 Статус", callback_data="tracking_status"))
+    return keyboard
+
+def portfolio_keyboard(symbol=None):
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    if symbol:
+        keyboard.add(
+            InlineKeyboardButton("📈 Добавить позицию", callback_data=f"add_pos_{symbol}"),
+            InlineKeyboardButton("❌ Закрыть позицию", callback_data=f"close_pos_{symbol}")
+        )
+    keyboard.add(InlineKeyboardButton("📊 НОВЫЙ АНАЛИЗ", callback_data="new_analyze"))
+    keyboard.add(InlineKeyboardButton("🏠 МЕНЮ", callback_data="menu"))
     return keyboard
 
 # ============================================
@@ -268,218 +295,285 @@ def pl_keyboard(symbol):
 
 @bot.message_handler(commands=['start'])
 def start(message):
-    bot.send_message(message.chat.id, 
-        "🤖 <b>КРИПТО-АНАЛИТИК БОТ v5.0</b>\n\n"
-        "📊 <b>Что я умею:</b>\n"
-        "• Анализировать BTC и ETH\n"
-        "• Рассчитывать потенциальную прибыль/убыток с $100\n"
-        "• Давать 2 уровня Take Profit\n"
-        "• Показывать Stop Loss\n"
-        "• Отслеживать реальный P&L\n\n"
-        "💰 <b>Пример:</b> При сигнале LONG с TP1 +1.5%\n"
-        "Вложение $100 → прибыль $1.50\n\n"
-        "Выбери действие 👇",
-        parse_mode='HTML', reply_markup=main_keyboard())
-
-@bot.message_handler(func=lambda m: m.text == "💰 P&L ОТСЛЕЖИВАНИЕ")
-def pl_tracking(message):
-    keyboard = InlineKeyboardMarkup()
-    keyboard.add(
-        InlineKeyboardButton("₿ BTC", callback_data="pl_BTC/USDT"),
-        InlineKeyboardButton("⟠ ETH", callback_data="pl_ETH/USDT")
-    )
-    keyboard.add(InlineKeyboardButton("📊 НАЗАД К АНАЛИЗУ", callback_data="new"))
-    bot.send_message(message.chat.id, 
-                     "📊 <b>ОТСЛЕЖИВАНИЕ ПРИБЫЛИ/УБЫТКА</b>\n\n"
-                     "Выбери монету, чтобы увидеть текущий P&L:\n"
-                     "• Если купил по цене сигнала\n"
-                     "• С момента последнего анализа\n\n"
-                     "<i>Данные обновляются в реальном времени</i>",
-                     parse_mode='HTML', reply_markup=keyboard)
-
-@bot.message_handler(commands=['help'])
-def help_msg(message):
-    help_text = """📖 <b>ПОМОЩЬ</b>
-
-<b>🔍 КАК ЧИТАТЬ СИГНАЛ:</b>
-
-• <b>LONG 🟢</b> - рекомендуем покупать
-• <b>SHORT 🔴</b> - рекомендуем продавать
-• <b>WAIT ⏳</b> - лучше подождать
-
-<b>💰 ПРИБЫЛЬ С $100:</b>
-Показывает, сколько денег вы заработаете или потеряете при вложении $100
-
-<b>🎯 ДВА УРОВНЯ TP:</b>
-• TP1 - первая цель (фиксируем часть прибыли)
-• TP2 - вторая цель (основная прибыль)
-
-<b>🛑 STOP LOSS:</b>
-Максимальный убыток, который рекомендуется допустить
-
-<b>📊 R:R (Риск/Прибыль):</b>
-Соотношение потенциальной прибыли к убытку. > 1:2 - отлично
-
-<b>💰 P&L ОТСЛЕЖИВАНИЕ:</b>
-Показывает реальную прибыль/убыток, если вы вошли по сигналу бота"""
+    user_id = str(message.chat.id)
+    if user_id not in user_data:
+        user_data[user_id] = {'tracking': False, 'alerts': {}, 'portfolio': {}}
+        save_settings()
     
-    bot.send_message(message.chat.id, help_text, parse_mode='HTML')
+    text = """🤖 <b>КРИПТО-ТРЕЙДЕР БОТ v6.0</b>
 
-@bot.message_handler(func=lambda m: m.text in ["📊 ПОЛУЧИТЬ СИГНАЛ", "📈 BTC/USDT", "🔷 ETH/USDT"])
-def handle_analysis(message):
-    symbol = "BTC/USDT" if "BTC" in message.text else "ETH/USDT" if "ETH" in message.text else "BTC/USDT"
-    
-    msg = bot.send_message(message.chat.id, f"🔄 <b>Анализирую {symbol}...</b>", parse_mode='HTML')
-    
-    # Получаем цены
-    closes = get_historical_prices(symbol)
-    if not closes:
-        bot.edit_message_text(f"❌ Ошибка: не удалось получить данные по {symbol}", 
-                              message.chat.id, msg.message_id)
-        return
-    
-    rsi_val = get_rsi(closes)
-    current_price = closes[-1]
-    price_before = closes[-2]
-    change = ((current_price - price_before) / price_before) * 100
-    
-    # Рассчитываем цели
-    targets = calculate_potential_targets(current_price, rsi_val, change)
-    
-    # Анализ с ИИ
-    analysis = analyze_with_ai(closes, rsi_val, symbol, targets)
-    
-    # Сохраняем цену для P&L отслеживания
-    if symbol not in price_history:
-        price_history[symbol] = []
-    price_history[symbol].append({
-        'timestamp': time.time(),
-        'price': current_price,
-        'signal': targets['signal_type']
-    })
-    # Оставляем только последние 10 записей
-    price_history[symbol] = price_history[symbol][-10:]
-    
-    result = f"""🔍 <b>АНАЛИЗ {symbol}</b>
-━━━━━━━━━━━━━━━━━━━━━
+<b>📊 Что я умею:</b>
+• Анализ BTC и ETH в реальном времени
+• Расчёт реальной прибыли/убытка (не с $100)
+• Фоновое отслеживание цены
+• Оповещения о резких движениях
+• Управление портфелем
 
-💰 <b>Текущая цена:</b> {current_price:.0f}$
-📊 <b>Изменение:</b> <b>{change:+.2f}%</b>
-📉 <b>RSI:</b> {rsi_val:.1f}/100
+<b>🔔 ФОНОВЫЙ РЕЖИМ:</b>
+Бот сам присылает уведомления когда цена меняется на 1%+ даже если вы не в чате!
 
-{analysis}
+<b>💰 МОЙ ПОРТФЕЛЬ:</b>
+Добавьте свои позиции и бот будет отслеживать реальную прибыль
 
-<i>💰 Прибыль/убыток рассчитан при вложении $100</i>
-<i>⚠️ Не является инвестиционной рекомендацией</i>"""
+Выберите действие 👇"""
     
-    bot.edit_message_text(result, message.chat.id, msg.message_id, 
-                          parse_mode='HTML', reply_markup=inline_menu())
+    bot.send_message(message.chat.id, text, parse_mode='HTML', reply_markup=main_keyboard())
 
-def show_pl(call, symbol):
-    """Показывает реальный P&L по монете"""
-    closes = get_historical_prices(symbol, 5)
-    if not closes:
-        bot.answer_callback_query(call.id, "❌ Ошибка получения данных")
-        return
+@bot.message_handler(func=lambda m: m.text == "📊 АНАЛИЗ")
+def analysis_menu(message):
+    bot.send_message(message.chat.id, "🪙 Выберите криптовалюту для анализа:", 
+                     reply_markup=crypto_keyboard())
+
+@bot.message_handler(func=lambda m: m.text == "💰 МОЙ ПОРТФЕЛЬ")
+def portfolio_menu(message):
+    user_id = str(message.chat.id)
+    portfolio = user_data.get(user_id, {}).get('portfolio', {})
     
-    current_price = closes[-1]
-    
-    # Берём последний сигнал по этой монете
-    last_signals = [s for s in price_history.get(symbol, [])]
-    
-    if not last_signals:
-        # Нет истории - показываем гипотетический вход по текущей цене
-        pl = calculate_pl(current_price, current_price, 100)
-        text = f"""📊 <b>P&L {symbol}</b>
-━━━━━━━━━━━━━━━━━━━━━
+    if not portfolio:
+        text = """📊 <b>ВАШ ПОРТФЕЛЬ ПУСТ</b>
 
-⚠️ <b>Нет истории сигналов</b>
+Чтобы добавить позицию:
+1. Нажмите «📊 АНАЛИЗ»
+2. Выберите монету
+3. Нажмите «Добавить в портфель»
 
-Совет: Нажми «📊 ПОЛУЧИТЬ СИГНАЛ» для {symbol}
-Затем я буду отслеживать потенциальную прибыль
-
-💰 <b>Если бы вы вошли сейчас:</b>
-• Вход: {current_price:.0f}$
-• Профит: $0.00 (0%)
-• Стоп-лосс: рекомендуем -1%"""
+Бот будет автоматически отслеживать вашу прибыль/убыток!"""
     else:
-        last_signal = last_signals[-1]
-        entry_price = last_signal['price']
-        signal_type = last_signal['signal']
-        pl = calculate_pl(entry_price, current_price, 100)
+        text = "<b>💰 ВАШ ПОРТФЕЛЬ</b>\n\n"
+        total_pnl = 0
+        for symbol, pos in portfolio.items():
+            if pos.get('active', False):
+                current_price = get_crypto_price(symbol)
+                if current_price:
+                    pl_data = calculate_real_pl(pos['entry_price'], current_price, pos['amount'])
+                    emoji = "🟢" if pl_data['pnl'] >= 0 else "🔴"
+                    text += f"{emoji} <b>{symbol}/USDT</b>\n"
+                    text += f"   Вход: ${pos['entry_price']:,.0f}\n"
+                    text += f"   Сейчас: ${current_price:,.0f}\n"
+                    text += f"   P&L: <b>{pl_data['pnl']:+.2f}$</b> ({pl_data['pnl_percent']:+.1f}%)\n"
+                    text += f"   Количество: {pos['amount']:.4f}\n\n"
+                    total_pnl += pl_data['pnl']
         
-        emoji = "🟢📈" if pl['pnl_usd'] >= 0 else "🔴📉"
-        sign = "+" if pl['pnl_usd'] >= 0 else ""
-        
-        text = f"""📊 <b>P&L {symbol}</b>
-━━━━━━━━━━━━━━━━━━━━━
-
-{emoji} <b>Результат по сигналу:</b> {signal_type}
-
-💰 <b>Цена входа:</b> {entry_price:.0f}$
-💹 <b>Текущая цена:</b> {current_price:.0f}$
-
-━━━━━━━━━━━━━━━━━━━━━
-<b>ПРИБЫЛЬ/УБЫТОК:</b>
-
-💵 <b>{sign}{pl['pnl_usd']:.2f}$</b> <code>({sign}{pl['pnl_percent']:.1f}%)</code>
-
-📊 <b>Сумма:</b> ${pl['current_value']:.2f}
-🪙 <b>Монет:</b> {pl['coins']:.6f}
-
-━━━━━━━━━━━━━━━━━━━━━
-<i>При вложении $100 во время последнего сигнала</i>
-<i>Данные обновлены: {datetime.now().strftime('%H:%M:%S')}</i>"""
+        text += f"━━━━━━━━━━━━━━━━━━━━━\n"
+        text += f"<b>Общий P&L: {total_pnl:+.2f}$</b>"
     
-    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, 
-                          parse_mode='HTML', reply_markup=pl_keyboard(symbol))
+    bot.send_message(message.chat.id, text, parse_mode='HTML', 
+                     reply_markup=portfolio_keyboard())
+
+@bot.message_handler(func=lambda m: m.text == "🔔 ФОНОВЫЙ РЕЖИМ")
+def tracking_menu(message):
+    user_id = str(message.chat.id)
+    is_tracking = user_data.get(user_id, {}).get('tracking', False)
+    
+    status = "🟢 ВКЛЮЧЕН" if is_tracking else "🔴 ВЫКЛЮЧЕН"
+    text = f"""🔔 <b>ФОНОВОЕ ОТСЛЕЖИВАНИЕ</b>
+
+Статус: {status}
+
+<b>Что делает:</b>
+• Следит за ценой BTC и ETH каждые 30 секунд
+• Присылает уведомление при изменении на 1%+
+• Работает даже когда вы не в чате с ботом
+
+<b>Уведомления:</b>
+• BTC/USDT и ETH/USDT
+• Ваши активные позиции из портфеля
+• Достижение целей и стоп-лоссов
+
+Выберите действие:"""
+    
+    bot.send_message(message.chat.id, text, parse_mode='HTML', 
+                     reply_markup=tracking_keyboard())
+
+@bot.message_handler(func=lambda m: m.text == "ℹ️ ПОМОЩЬ")
+def help_menu(message):
+    text = """📖 <b>ПОМОЩЬ</b>
+
+<b>📊 АНАЛИЗ:</b>
+Показывает реальную прибыль/убыток при покупке 1 монеты
+
+<b>💰 МОЙ ПОРТФЕЛЬ:</b>
+Добавляйте свои сделки и отслеживайте реальный P&L
+
+<b>🔔 ФОНОВЫЙ РЕЖИМ:</b>
+Включите и бот сам будет присылать уведомления о движении цены
+
+<b>Как добавить позицию:</b>
+1. Нажмите «📊 АНАЛИЗ»
+2. Выберите монету
+3. Нажмите «➕ Добавить в портфель»
+4. Введите количество монет
+
+Бот будет автоматически рассчитывать вашу прибыль!"""
+    
+    bot.send_message(message.chat.id, text, parse_mode='HTML')
+
+def analyze_crypto(message, symbol):
+    """Анализ монеты с реальным P&L"""
+    current_price = get_crypto_price(symbol)
+    if not current_price:
+        bot.send_message(message.chat.id, f"❌ Не удалось получить цену {symbol}")
+        return
+    
+    prices = get_historical_prices(symbol, 30)
+    rsi = get_rsi(prices) if prices else 50
+    
+    # Определяем сигнал
+    if rsi < 30:
+        signal = "🟢 ПОКУПКА"
+        action = "Хороший момент для входа"
+    elif rsi > 70:
+        signal = "🔴 ПРОДАЖА"
+        action = "Рекомендуется фиксация"
+    else:
+        signal = "⚪ НЕЙТРАЛЬНО"
+        action = "Лучше подождать"
+    
+    # Рассчитываем изменение за час
+    if prices and len(prices) >= 12:
+        hour_ago = prices[-12]
+        hour_change = ((current_price - hour_ago) / hour_ago) * 100
+    else:
+        hour_change = 0
+    
+    # Реальная прибыль для 1 монеты
+    if len(prices) >= 2:
+        day_ago = prices[0]
+        day_change = ((current_price - day_ago) / day_ago) * 100
+    else:
+        day_change = 0
+    
+    text = f"""📊 <b>АНАЛИЗ {symbol}/USDT</b>
+━━━━━━━━━━━━━━━━━━━━━
+
+💰 <b>Текущая цена:</b> ${current_price:,.0f}
+
+📈 <b>Изменения:</b>
+• За 5 мин: {((prices[-1] - prices[-2]) / prices[-2] * 100) if prices and len(prices) >= 2 else 0:+.2f}%
+• За час: {hour_change:+.2f}%
+• За день: {day_change:+.2f}%
+
+📉 <b>RSI:</b> {rsi:.1f}/100
+
+━━━━━━━━━━━━━━━━━━━━━
+<b>🎯 СИГНАЛ:</b> {signal}
+📝 {action}
+
+<b>💰 ПРИБЫЛЬ/УБЫТОК (на 1 монету):</b>
+• Если купили час назад: {hour_change:+.1f}% = ${current_price - (current_price/(1+hour_change/100)):+.0f}$
+• Если купили вчера: {day_change:+.1f}% = ${current_price - (current_price/(1+day_change/100)):+.0f}$
+
+━━━━━━━━━━━━━━━━━━━━━
+<i>🕐 {datetime.now().strftime('%H:%M:%S')}</i>"""
+    
+    # Кнопки для добавления в портфель
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton(f"➕ Добавить {symbol} в портфель", callback_data=f"add_{symbol}"))
+    keyboard.add(InlineKeyboardButton("🏠 МЕНЮ", callback_data="menu"))
+    
+    bot.send_message(message.chat.id, text, parse_mode='HTML', reply_markup=keyboard)
 
 @bot.callback_query_handler(func=lambda call: True)
-def callback(call):
-    if call.data == "new":
-        handle_analysis(call.message)
-    elif call.data == "btc":
-        handle_analysis(call.message)
-        call.message.text = "📈 BTC/USDT"
-    elif call.data == "eth":
-        handle_analysis(call.message)
-        call.message.text = "🔷 ETH/USDT"
-    elif call.data == "pl_BTC/USDT":
-        show_pl(call, "BTC/USDT")
-    elif call.data == "pl_ETH/USDT":
-        show_pl(call, "ETH/USDT")
-    elif call.data.startswith("pl_"):
-        symbol = call.data.replace("pl_", "")
-        show_pl(call, symbol)
+def callback_handler(call):
+    user_id = str(call.message.chat.id)
+    
+    if call.data.startswith("analyze_"):
+        symbol = call.data.replace("analyze_", "")
+        analyze_crypto(call.message, symbol)
+    
+    elif call.data.startswith("add_"):
+        symbol = call.data.replace("add_", "")
+        bot.answer_callback_query(call.id, f"Введите количество {symbol} в чат")
+        bot.send_message(call.message.chat.id, 
+                        f"📝 Введите количество {symbol} (например: 0.5)\n\nИли нажмите «1» для 1 монеты")
+        # Сохраняем состояние
+        user_data[user_id]['temp_symbol'] = symbol
+        save_settings()
+    
+    elif call.data == "tracking_on":
+        start_price_tracking(user_id)
+        bot.answer_callback_query(call.id, "✅ Фоновый режим ВКЛЮЧЕН")
+        bot.edit_message_text("🔔 <b>Фоновый режим активирован!</b>\n\nБот будет присылать уведомления при изменении цены на 1%+", 
+                              call.message.chat.id, call.message.message_id, parse_mode='HTML')
+    
+    elif call.data == "tracking_off":
+        stop_price_tracking(user_id)
+        bot.answer_callback_query(call.id, "❌ Фоновый режим ВЫКЛЮЧЕН")
+        bot.edit_message_text("🔕 <b>Фоновый режим выключен</b>\n\nУведомления больше приходить не будут", 
+                              call.message.chat.id, call.message.message_id, parse_mode='HTML')
+    
+    elif call.data == "tracking_status":
+        is_tracking = user_data.get(user_id, {}).get('tracking', False)
+        status = "включен 🟢" if is_tracking else "выключен 🔴"
+        bot.answer_callback_query(call.id, f"Фоновый режим {status}")
+    
+    elif call.data == "new_analyze":
+        analysis_menu(call.message)
+    
+    elif call.data == "menu":
+        start(call.message)
     
     bot.answer_callback_query(call.id)
+
+# Обработка ввода количества монет
+@bot.message_handler(func=lambda m: m.text.replace('.', '').replace('-', '').isdigit() and len(m.text) < 10)
+def handle_amount(message):
+    user_id = str(message.chat.id)
+    if user_id in user_data and 'temp_symbol' in user_data[user_id]:
+        symbol = user_data[user_id]['temp_symbol']
+        amount = float(message.text)
+        current_price = get_crypto_price(symbol)
+        
+        if current_price:
+            # Сохраняем позицию
+            if 'portfolio' not in user_data[user_id]:
+                user_data[user_id]['portfolio'] = {}
+            
+            user_data[user_id]['portfolio'][symbol] = {
+                'active': True,
+                'entry_price': current_price,
+                'amount': amount,
+                'timestamp': time.time()
+            }
+            save_settings()
+            
+            value = amount * current_price
+            text = f"""✅ <b>Позиция добавлена!</b>
+
+{symbol}/USDT
+💰 Цена входа: ${current_price:,.0f}
+🪙 Количество: {amount:.4f}
+💵 Сумма: ${value:,.0f}
+
+Теперь бот будет отслеживать вашу позицию в фоновом режиме!
+Нажмите «💰 МОЙ ПОРТФЕЛЬ» чтобы увидеть P&L"""
+            
+            bot.send_message(message.chat.id, text, parse_mode='HTML')
+            del user_data[user_id]['temp_symbol']
+            save_settings()
+        else:
+            bot.send_message(message.chat.id, "❌ Ошибка получения цены")
 
 # ============================================
 # ЗАПУСК
 # ============================================
 
 if __name__ == "__main__":
+    load_settings()
+    
     print("=" * 50)
-    print("🤖 КРИПТО-АНАЛИТИК БОТ v5.0")
+    print("🤖 КРИПТО-ТРЕЙДЕР БОТ v6.0")
     print("=" * 50)
     print("✅ НОВЫЕ ФУНКЦИИ:")
-    print("   • Два уровня Take Profit")
-    print("   • Стоп-лосс")
-    print("   • Расчёт прибыли/убытка с $100")
-    print("   • Real-time P&L отслеживание")
-    print("   • Соотношение Риск/Прибыль")
-    print("=" * 50)
-    
-    test = get_historical_prices("BTC/USDT", 5)
-    if test:
-        print(f"✅ Данные получены! Цена BTC: {test[-1]:.0f}$")
-    else:
-        print("⚠️ Тестовые данные")
-    
+    print("   • Реальный P&L (без привязки к $100)")
+    print("   • Фоновое отслеживание цены")
+    print("   • Автоматические уведомления")
+    print("   • Портфель с реальными позициями")
     print("=" * 50)
     print("✅ БОТ ГОТОВ! Напиши /start в Telegram")
     print("=" * 50)
     
+    # Запускаем бота
     while True:
         try:
             bot.infinity_polling(timeout=60)
